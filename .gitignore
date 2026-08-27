@@ -22,3 +22,12 @@ Thumbs.db
 
 # Personal editor workspace files
 *.code-workspace
+
+# Altium project backups/logs/previews — not source, don't commit
+hardware/**/History/
+hardware/**/Project Logs for */
+hardware/**/Project Outputs for */
+hardware/**/__Previews/
+hardware/**/*.WAS
+hardware/**/*.PcbDoc.Bak*
+hardware/**/*.SchDoc.Bak*

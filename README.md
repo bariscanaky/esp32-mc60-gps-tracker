@@ -35,6 +35,13 @@ Written in C++ on the Arduino framework, built with PlatformIO.
 <!-- TODO: pin table + a photo of the board here. Bir kart fotoğrafı README'yi
      bir anda ciddi gösteriyor, mutlaka ekle. -->
 
+## PCB design files
+
+Schematic and PCB layout live in [`hardware/esp32v4/`](hardware/esp32v4/) as
+an Altium Designer project (`.PrjPcb` / `.SchDoc` / `.PcbDoc`, plus the custom
+schematic/PCB libraries the design depends on). Open `esp32v4.PrjPcb` in
+Altium Designer to view or edit.
+
 ## Build
 
 ```bash
@@ -73,11 +80,18 @@ from inside the AT engine.
 
 ## Architecture
 
-`pumpSerial()` reads bytes from the module and hands complete lines to
-`handleLine()`, which dispatches URCs (`+CMT`, `+QMTSTAT`) and AT responses.
-`sendAT()` returns as soon as the expected token or `ERROR` arrives — the
-timeout is a ceiling, not a fixed wait, which is what keeps the boot sequence
-at a few seconds instead of ~40.
+A state machine in `main.cpp`, driven from `loop()` via `currentState`.
+Transitions go through `enterState()`, which resets the per-state retry
+counter — state handlers never assign `currentState` directly.
+
+`sendCommand()` is the blocking AT helper: it busy-waits up to its timeout
+argument, buffering incoming bytes into `mc60Buffer` as they arrive so an SMS
+URC that lands mid-transaction isn't lost. `checkForSMS()` parses `+CMT:`
+URCs out of that buffer and queues authorized senders' commands onto
+`smsQueue`; it never dispatches directly, since it also runs re-entrantly
+from inside `sendCommand()`'s wait loop. `processSmsCommand()` drains that
+queue and executes `LOC` / `STATUS` / `PWROFF` — called only from the top
+level of `loop()`, so it can't re-enter the AT engine mid-transaction.
 
 NMEA fields are split manually rather than with `strtok`, because `strtok`
 collapses consecutive commas and GGA is full of empty fields on a weak fix.
