@@ -18,9 +18,14 @@ Written in C on native ESP-IDF (no Arduino framework, no PlatformIO).
   renders correctly
 - SMS command interface with sender extraction from the `+CMT:` URC and a
   last-10-digits allowlist (so `+90…`, `0…` and bare formats all match)
+- Two-tier SMS authorization: admin numbers get the full command set,
+  viewer numbers can query location/status only
 - Replies go back to the *sender*, not to a hardcoded number
 - Automatic recovery: per-state retry counters, MC60 power-cycle and FSM
   restart instead of a dead halt state
+- Last known GPS fix and a per-reset-reason boot counter persist in NVS, so
+  a `LOC` request right after a reboot can fall back to the last-known
+  position, and `STATUS` reports brownout/panic/software reset history
 
 ## Hardware
 
@@ -61,20 +66,24 @@ cp main/credentials.example.h main/credentials.h
 | `IO_USERNAME` / `IO_KEY` | Adafruit IO account and key |
 | `FEED_NAME` | Target feed |
 | `SIM_APN` | Carrier APN |
-| `AUTHORIZED_NUMBERS` | Numbers allowed to issue SMS commands |
+| `AUTHORIZED_NUMBERS` | Admin numbers — full command access |
+| `VIEWER_NUMBERS` | Viewer numbers — `LOC`/`STATUS`/`HELP` only. Leave `{ }` for none. |
 
 `main/credentials.h` is gitignored.
 
 ## SMS commands
 
-| Command | Effect |
-|---|---|
-| `LOC` / `GPS` / `GETGPS` | Replies with the current GPS fix as a Google Maps link |
-| `STATUS` | Replies with the current state-machine state and uptime |
-| `PWROFF` | Pulses PWRKEY to power off the MC60 and returns the state machine to `STATE_POWER_ON` |
+| Command | Tier | Effect |
+|---|---|---|
+| `LOC` / `GPS` / `GETGPS` | admin, viewer | Replies with the current GPS fix as a Google Maps link, or the last-known persisted fix if there's no live one |
+| `STATUS` | admin, viewer | Replies with state, uptime, current upload interval, and NVS-persisted reset counts |
+| `HELP` | admin, viewer | Lists available commands (admin sees the full set) |
+| `SETINTERVAL <seconds>` | admin | Changes the Adafruit IO upload interval for this boot (10–3600s); not persisted across reboots |
+| `PWROFF` | admin | Pulses PWRKEY to power off the MC60 and returns the state machine to `STATE_POWER_ON` |
 
-Commands arriving mid-transaction are queued and executed from the top level
-of the main loop, never from inside the AT engine.
+Commands arriving mid-transaction are queued (along with the sender's
+authorization tier) and executed from the top level of the main loop, never
+from inside the AT engine.
 
 ## Architecture
 
@@ -89,12 +98,18 @@ arrive so an SMS URC that lands mid-transaction isn't lost. `mc60_pump()`
 parses `+CMT:` URCs out of that buffer and queues authorized senders'
 commands onto an SMS queue; it never dispatches directly, since it also runs
 re-entrantly from inside `mc60_send_command()`'s wait loop. `main.c`'s
-`process_sms_command()` drains that queue and executes `LOC` / `STATUS` /
-`PWROFF` — called only from the top level of the main loop, so it can't
-re-enter the AT engine mid-transaction.
+`process_sms_command()` drains that queue and executes the commands above,
+gating admin-only ones on the sender's role — called only from the top
+level of the main loop, so it can't re-enter the AT engine mid-transaction.
 
 NMEA fields are split manually rather than with `strtok`, because `strtok`
 collapses consecutive commas and GGA is full of empty fields on a weak fix.
+
+`storage.c` wraps NVS: it persists the last successful GPS fix (overwritten
+on every read) and a running count of reset reasons (brownout/panic/software
+restart), initialized once from `app_main()`. Both are best-effort — if NVS
+fails to open, every `storage_*` call becomes a no-op/false for that boot
+rather than halting the tracker.
 
 ## Known quirks
 

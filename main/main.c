@@ -1,5 +1,6 @@
 #include <ctype.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "esp_log.h"
@@ -10,6 +11,7 @@
 #include "config.h"
 #include "credentials.h" // IO_USERNAME, IO_KEY, FEED_NAME, SIM_APN, AUTHORIZED_NUMBERS
 #include "mc60.h"
+#include "storage.h"
 
 static const char *TAG = "mc60_tracker";
 
@@ -40,6 +42,10 @@ static bool gps_enabled = false;
 static bool pwrkey_pulse_active = false;
 static int boot_retry_counter = 0; // survives POWER_ON<->WAIT_FOR_BOOT cycling, unlike retry_counter
 static int consecutive_publish_failures = 0;
+
+// Runtime-adjustable upload interval (SMS command SETINTERVAL). Not
+// persisted across reboots -- resets to the config.h default on restart.
+static uint32_t upload_interval_ms = UPLOAD_INTERVAL_MS;
 
 // --- Central state transition helper ---
 // Resets everything that must never leak from one state into the next.
@@ -88,30 +94,82 @@ static bool str_ends_with(const char *s, const char *suffix)
     return ls >= lf && strcmp(s + (ls - lf), suffix) == 0;
 }
 
+// Parses "SETINTERVAL <seconds>" (any amount of whitespace/'=' between the
+// keyword and the number, and tolerant of a prefix before the keyword, same
+// as the other commands' suffix matching). Returns false if the keyword
+// isn't present or no digits follow it.
+static bool parse_set_interval(const char *cmd, long *out_seconds)
+{
+    const char *p = strstr(cmd, "SETINTERVAL");
+    if (!p) return false;
+    p += strlen("SETINTERVAL");
+    while (*p && !isdigit((unsigned char)*p)) p++;
+    if (!*p) return false;
+    *out_seconds = strtol(p, NULL, 10);
+    return true;
+}
+
 // Only ever called from the top level of the main loop, never re-entrantly
 // from inside mc60_send_command()'s wait loop -- so it's safe to hit the AT
 // engine here.
-static void process_sms_command(const char *sender, const char *text)
+static void process_sms_command(const char *sender, const char *text, mc60_role_t role)
 {
     char cmd[MC60_SMS_TEXT_BUF_SIZE];
     strlcpy(cmd, text, sizeof(cmd));
     str_upper_inplace(cmd);
 
+    long set_interval_seconds;
+
     if (str_ends_with(cmd, "PWROFF")) {
+        if (role != MC60_ROLE_ADMIN) {
+            mc60_send_sms(sender, "Not authorized for this command (admin only).");
+            return;
+        }
         ESP_LOGI(TAG, "Action: Powering Off.");
         mc60_send_sms(sender, "Powering off.");
         power_off_module();
     } else if (str_ends_with(cmd, "LOC") || str_ends_with(cmd, "GPS") || str_ends_with(cmd, "GETGPS")) {
         ESP_LOGI(TAG, "Action: Fetching GPS and replying...");
-        mc60_send_gps_via_sms(sender);
+        float last_lat, last_lon;
+        bool have_last_fix = storage_load_last_fix(&last_lat, &last_lon);
+        mc60_send_gps_via_sms(sender, have_last_fix, last_lat, last_lon);
     } else if (str_ends_with(cmd, "STATUS")) {
         ESP_LOGI(TAG, "Action: Sending status...");
-        char msg[64];
-        snprintf(msg, sizeof(msg), "State=%d Uptime=%lus", (int)current_state,
-                 (unsigned long)(millis() / 1000));
+        char reset_summary[64];
+        storage_format_reset_summary(reset_summary, sizeof(reset_summary));
+        char msg[160];
+        snprintf(msg, sizeof(msg), "State=%d Uptime=%lus Interval=%lus Resets[%s]",
+                 (int)current_state, (unsigned long)(millis() / 1000),
+                 (unsigned long)(upload_interval_ms / 1000), reset_summary);
         mc60_send_sms(sender, msg);
+    } else if (parse_set_interval(cmd, &set_interval_seconds)) {
+        if (role != MC60_ROLE_ADMIN) {
+            mc60_send_sms(sender, "Not authorized for this command (admin only).");
+            return;
+        }
+        // Bounds-check in the seconds domain, before the *1000 multiply --
+        // strtol() can return a value large enough to overflow uint32_t
+        // milliseconds and wrap around into the valid range.
+        long min_s = UPLOAD_INTERVAL_MIN_MS / 1000;
+        long max_s = UPLOAD_INTERVAL_MAX_MS / 1000;
+        if (set_interval_seconds < min_s || set_interval_seconds > max_s) {
+            char msg[96];
+            snprintf(msg, sizeof(msg), "Interval must be %ld-%lds.", min_s, max_s);
+            mc60_send_sms(sender, msg);
+        } else {
+            upload_interval_ms = (uint32_t)set_interval_seconds * 1000;
+            char msg[64];
+            snprintf(msg, sizeof(msg), "Upload interval set to %lds.", set_interval_seconds);
+            mc60_send_sms(sender, msg);
+        }
+    } else if (str_ends_with(cmd, "HELP")) {
+        if (role == MC60_ROLE_ADMIN) {
+            mc60_send_sms(sender, "Commands: LOC, STATUS, HELP, SETINTERVAL <sec>, PWROFF");
+        } else {
+            mc60_send_sms(sender, "Commands: LOC, STATUS, HELP");
+        }
     } else {
-        mc60_send_sms(sender, "Unknown command. Try: LOC, STATUS, PWROFF");
+        mc60_send_sms(sender, "Unknown command. Text HELP for a list.");
     }
 }
 
@@ -277,6 +335,7 @@ static void loop_once(void)
             float lat, lon;
             if (mc60_get_gps_coordinates(&lat, &lon)) {
                 ESP_LOGI(TAG, "Valid GPS fix acquired.");
+                storage_save_last_fix(lat, lon);
                 last_upload_time = now;
                 enter_state(STATE_RUNNING);
             } else if (now - state_timer > GPS_FIX_TIMEOUT_MS) {
@@ -291,9 +350,10 @@ static void loop_once(void)
 
         case STATE_RUNNING:
             // Only upload to Adafruit IO at the configured interval.
-            if (gps_enabled && now - last_upload_time >= UPLOAD_INTERVAL_MS) {
+            if (gps_enabled && now - last_upload_time >= upload_interval_ms) {
                 float lat, lon;
                 if (mc60_get_gps_coordinates(&lat, &lon)) {
+                    storage_save_last_fix(lat, lon);
                     if (mc60_publish_to_adafruit_io(lat, lon)) {
                         consecutive_publish_failures = 0;
                     } else {
@@ -332,8 +392,9 @@ static void loop_once(void)
     // can never re-enter the AT engine mid-transaction.
     char sender[MC60_SMS_SENDER_BUF_SIZE];
     char text[MC60_SMS_TEXT_BUF_SIZE];
-    if (mc60_dequeue_sms(sender, sizeof(sender), text, sizeof(text))) {
-        process_sms_command(sender, text);
+    mc60_role_t role;
+    if (mc60_dequeue_sms(sender, sizeof(sender), text, sizeof(text), &role)) {
+        process_sms_command(sender, text, role);
     }
 }
 
@@ -348,6 +409,7 @@ void app_main(void)
         }
     }
 
+    storage_init();
     mc60_init();
     pwrkey_gpio_init();
 

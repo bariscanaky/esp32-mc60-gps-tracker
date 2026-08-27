@@ -17,7 +17,9 @@
 #define MC60_UART_RX_BUF_SIZE 1024
 
 // --- Timers & Intervals (ms) ---
-#define UPLOAD_INTERVAL_MS        10000
+#define UPLOAD_INTERVAL_MS        10000  // default; changeable at runtime via the SETINTERVAL SMS command
+#define UPLOAD_INTERVAL_MIN_MS    10000  // floor -- below this, mc60_send_command()'s fixed AT-wait overhead dominates the cycle anyway
+#define UPLOAD_INTERVAL_MAX_MS  3600000  // ceiling (1 hour)
 #define GPS_FIX_TIMEOUT_MS        60000
 #define PWRKEY_PULSE_MS            1000
 #define FATAL_ERROR_RESTART_MS    30000
@@ -31,7 +33,7 @@
 #define MAX_PUBLISH_FAILURES   5
 
 // --- SMS queue ---
-#define SMS_QUEUE_CAPACITY 3
+#define SMS_QUEUE_CAPACITY 6  // was 3; a burst of authorized commands (or carrier redelivery) could overrun that
 
 // --- Buffer sizes ---
 #define MC60_RESP_BUF_SIZE          512  // generic AT response buffer

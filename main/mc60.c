@@ -16,8 +16,15 @@
 static const char *TAG = "mc60";
 
 // --- Authorized senders ---
+// AUTHORIZED_NUMBERS (admin): full command access, including PWROFF/SETINTERVAL.
+// VIEWER_NUMBERS (viewer): can query location/status but not change device
+// behavior. VIEWER_NUMBERS is optional -- credentials.example.h documents it
+// as `{ }` (empty) by default, so existing credentials.h files without it
+// still compile (an empty array has kViewerCount == 0).
 static const char *const kAuthorized[] = AUTHORIZED_NUMBERS;
 static const size_t kAuthorizedCount = sizeof(kAuthorized) / sizeof(kAuthorized[0]);
+static const char *const kViewer[] = VIEWER_NUMBERS;
+static const size_t kViewerCount = sizeof(kViewer) / sizeof(kViewer[0]);
 
 // --- Rolling buffer: accumulates raw bytes from the MC60 across the whole
 // run, consumed from the front as +CMT: URCs are parsed out of it. Capped at
@@ -31,6 +38,7 @@ static size_t rolling_len = 0;
 typedef struct {
     char sender[MC60_SMS_SENDER_BUF_SIZE];
     char text[MC60_SMS_TEXT_BUF_SIZE];
+    mc60_role_t role;
 } pending_sms_t;
 static pending_sms_t sms_queue[SMS_QUEUE_CAPACITY];
 static size_t sms_queue_head = 0;
@@ -64,25 +72,31 @@ static void last10_digits(const char *number, char out[11])
 
 size_t mc60_authorized_count(void)
 {
-    return kAuthorizedCount;
+    return kAuthorizedCount + kViewerCount;
 }
 
-bool mc60_is_authorized(const char *number)
+mc60_role_t mc60_get_role(const char *number)
 {
     char num_d[11];
     last10_digits(number, num_d);
-    if (num_d[0] == '\0') return false;
+    if (num_d[0] == '\0') return MC60_ROLE_NONE;
+
     for (size_t i = 0; i < kAuthorizedCount; i++) {
         char auth_d[11];
         last10_digits(kAuthorized[i], auth_d);
-        if (strcmp(num_d, auth_d) == 0) return true;
+        if (strcmp(num_d, auth_d) == 0) return MC60_ROLE_ADMIN;
     }
-    return false;
+    for (size_t i = 0; i < kViewerCount; i++) {
+        char viewer_d[11];
+        last10_digits(kViewer[i], viewer_d);
+        if (strcmp(num_d, viewer_d) == 0) return MC60_ROLE_VIEWER;
+    }
+    return MC60_ROLE_NONE;
 }
 
 // --- SMS queue helpers ---
 
-static bool mc60_enqueue_sms(const char *sender, const char *text)
+static bool mc60_enqueue_sms(const char *sender, const char *text, mc60_role_t role)
 {
     if (sms_queue_count >= SMS_QUEUE_CAPACITY) {
         ESP_LOGW(TAG, "SMS queue full, dropping message.");
@@ -91,15 +105,18 @@ static bool mc60_enqueue_sms(const char *sender, const char *text)
     size_t idx = (sms_queue_head + sms_queue_count) % SMS_QUEUE_CAPACITY;
     strlcpy(sms_queue[idx].sender, sender, sizeof(sms_queue[idx].sender));
     strlcpy(sms_queue[idx].text, text, sizeof(sms_queue[idx].text));
+    sms_queue[idx].role = role;
     sms_queue_count++;
     return true;
 }
 
-bool mc60_dequeue_sms(char *out_sender, size_t sender_size, char *out_text, size_t text_size)
+bool mc60_dequeue_sms(char *out_sender, size_t sender_size, char *out_text, size_t text_size,
+                      mc60_role_t *out_role)
 {
     if (sms_queue_count == 0) return false;
     strlcpy(out_sender, sms_queue[sms_queue_head].sender, sender_size);
     strlcpy(out_text, sms_queue[sms_queue_head].text, text_size);
+    if (out_role) *out_role = sms_queue[sms_queue_head].role;
     sms_queue_head = (sms_queue_head + 1) % SMS_QUEUE_CAPACITY;
     sms_queue_count--;
     return true;
@@ -170,10 +187,11 @@ static void mc60_check_for_sms(void)
 
     ESP_LOGI(TAG, "*** DIRECT SMS RECEIVED *** From: %s Message: %s", sender, text);
 
-    if (!mc60_is_authorized(sender)) {
+    mc60_role_t role = mc60_get_role(sender);
+    if (role == MC60_ROLE_NONE) {
         ESP_LOGI(TAG, "Sender NOT authorized. Ignoring.");
     } else {
-        mc60_enqueue_sms(sender, text);
+        mc60_enqueue_sms(sender, text, role);
     }
 }
 
@@ -268,12 +286,16 @@ void mc60_send_sms(const char *number, const char *text)
     ESP_LOGI(TAG, "SMS Sent.");
 }
 
-void mc60_send_gps_via_sms(const char *reply_to)
+void mc60_send_gps_via_sms(const char *reply_to, bool have_last_fix, float last_lat, float last_lon)
 {
     float lat, lon;
-    char msg[96];
+    char msg[128];
     if (mc60_get_gps_coordinates(&lat, &lon)) {
         snprintf(msg, sizeof(msg), "Location: https://maps.google.com/?q=%.6f,%.6f", lat, lon);
+    } else if (have_last_fix) {
+        snprintf(msg, sizeof(msg),
+                 "No live fix. Last known (may be stale): https://maps.google.com/?q=%.6f,%.6f",
+                 last_lat, last_lon);
     } else {
         strlcpy(msg, "No GPS fix available right now. Try again later.", sizeof(msg));
     }

@@ -6,6 +6,15 @@
 
 #include "config.h"
 
+// SMS sender authorization tier. ROLE_NONE senders are silently ignored (as
+// in the original firmware); ROLE_VIEWER can query location/status; only
+// ROLE_ADMIN can issue commands that change device behavior or power state.
+typedef enum {
+    MC60_ROLE_NONE = 0,
+    MC60_ROLE_VIEWER,
+    MC60_ROLE_ADMIN,
+} mc60_role_t;
+
 // Brings up the MC60 UART link. Call once before anything else in this file.
 void mc60_init(void);
 
@@ -25,25 +34,31 @@ void mc60_pump(void);
 size_t mc60_send_command(const char *cmd, uint32_t timeout_ms, bool print,
                           char *out_resp, size_t out_resp_size);
 
-// Last-10-digits match, so "+905551234567", "05551234567" and "5551234567"
-// all match the same allowlist entry.
-bool mc60_is_authorized(const char *number);
+// Last-10-digits match against AUTHORIZED_NUMBERS (admin) then
+// VIEWER_NUMBERS (viewer), so "+905551234567", "05551234567" and
+// "5551234567" all match the same allowlist entry.
+mc60_role_t mc60_get_role(const char *number);
 
-// Number of entries in the AUTHORIZED_NUMBERS allowlist (from credentials.h).
+// Total entries across both the AUTHORIZED_NUMBERS and VIEWER_NUMBERS
+// allowlists (from credentials.h).
 size_t mc60_authorized_count(void);
 
 // Pops the oldest queued SMS command (enqueued by mc60_pump() from an
-// authorized sender) into the caller's buffers. Returns false if the queue
-// is empty.
+// authorized sender) into the caller's buffers, along with the sender's
+// role at the time it was queued. Returns false if the queue is empty.
 bool mc60_dequeue_sms(char *out_sender, size_t sender_size,
-                      char *out_text, size_t text_size);
+                      char *out_text, size_t text_size,
+                      mc60_role_t *out_role);
 
 // Sends a text SMS to `number`.
 void mc60_send_sms(const char *number, const char *text);
 
-// Replies to `reply_to` with the current GPS fix as a Google Maps link, or a
-// "no fix" message if none is available.
-void mc60_send_gps_via_sms(const char *reply_to);
+// Replies to `reply_to` with the current GPS fix as a Google Maps link. If
+// there's no live fix right now, falls back to `last_lat`/`last_lon` when
+// `have_last_fix` is true (marking the reply as a possibly-stale last-known
+// position), or sends a "no fix available" message when it's false.
+void mc60_send_gps_via_sms(const char *reply_to, bool have_last_fix,
+                            float last_lat, float last_lon);
 
 // Reads the MC60's current NMEA GGA sentence and extracts lat/lon. Returns
 // false if there's no valid fix.
