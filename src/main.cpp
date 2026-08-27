@@ -1,5 +1,5 @@
 #include <Arduino.h>
-#include "credentials.h" // IO_USERNAME, IO_KEY, FEED_NAME, SIM_APN, TARGET_PHONE ve AUTHORIZED_NUMBERS içermelidir.
+#include "credentials.h" // IO_USERNAME, IO_KEY, FEED_NAME, SIM_APN ve AUTHORIZED_NUMBERS içermelidir.
 
 // --- Pin Definitions ---
 const int MC60_PWRKEY_PIN = 45;
@@ -12,6 +12,8 @@ HardwareSerial MC60Serial(1);
 // --- Timers & Intervals ---
 const unsigned long UPLOAD_INTERVAL_MS = 10000; // 10 seconds
 const unsigned long GPS_FIX_TIMEOUT_MS = 60000; // 60 seconds
+const unsigned long PWRKEY_PULSE_MS = 1000;
+const unsigned long FATAL_ERROR_RESTART_MS = 30000; // auto-reboot after this long in FATAL_ERROR
 
 // --- Adafruit IO ---
 const char* ADAFRUIT_SERVER = "io.adafruit.com";
@@ -42,19 +44,37 @@ ModuleState currentState = STATE_POWER_ON;
 // --- Timers, Flags & Buffers ---
 unsigned long stateTimer = 0;
 unsigned long lastUploadTime = 0;
-int retryCounter = 0;
+int retryCounter = 0;             // resets on every enterState() call; only valid for "stay and retry" loops
 const int MAX_RETRIES = 5;
 bool gpsEnabled = false;
+bool pwrKeyPulseActive = false;
+int bootRetryCounter = 0;         // survives POWER_ON<->WAIT_FOR_BOOT cycling, unlike retryCounter
+int consecutivePublishFailures = 0;
+const int MAX_PUBLISH_FAILURES = 5;
 
 String mc60Buffer = ""; // Gelen anlık SMS'leri yakalamak için global hafıza
 
+// --- Pending SMS command queue (filled by the URC parser, drained by loop()) ---
+struct PendingSms {
+    String sender;
+    String text;
+};
+const size_t SMS_QUEUE_CAPACITY = 3;
+PendingSms smsQueue[SMS_QUEUE_CAPACITY];
+size_t smsQueueHead = 0;
+size_t smsQueueCount = 0;
+
 // --- Function Prototypes ---
+void enterState(ModuleState newState);
 String sendCommand(String cmd, unsigned long timeout, bool print=true);
 void checkForSMS();
+bool enqueueSms(const String &sender, const String &text);
+bool dequeueSms(PendingSms &out);
+void processSmsCommand(const String &sender, const String &text);
 void sendSMS(String number, String text);
 void sendGPSviaSMS(String replyTo);
 bool getGPSCoordinates(float &lat, float &lon);
-void publishToAdafruitIO(float lat, float lon);
+bool publishToAdafruitIO(float lat, float lon);
 void powerOffModule();
 bool isAuthorized(String number);
 
@@ -62,7 +82,7 @@ void setup() {
     Serial.begin(115200);
     Serial.println("\n--- MC60 Direct SMS & GPS Tracker ---");
 
-    if (String(IO_USERNAME) == "YOUR_ADAFRUIT_USERNAME") {
+    if (String(IO_USERNAME) == "your_adafruit_username") {
         Serial.println("Set your credentials in credentials.h");
         while(true) delay(1000);
     }
@@ -76,6 +96,16 @@ void setup() {
     Serial.println(kAuthorizedCount);
 }
 
+// --- Central state transition helper ---
+// Resets everything that must never leak from one state into the next.
+// Do NOT call this for "stay in the same state and retry" branches --
+// that would wipe retryCounter and defeat the retry cap.
+void enterState(ModuleState newState) {
+    currentState = newState;
+    retryCounter = 0;
+    stateTimer = millis();
+}
+
 void loop() {
     unsigned long now = millis();
 
@@ -83,16 +113,22 @@ void loop() {
     while(MC60Serial.available()) {
         mc60Buffer += (char)MC60Serial.read();
     }
-    checkForSMS(); 
+    checkForSMS();
 
     switch (currentState) {
         case STATE_POWER_ON:
-            Serial.println("State: POWER_ON");
-            digitalWrite(MC60_PWRKEY_PIN, HIGH);
-            delay(1000);
-            digitalWrite(MC60_PWRKEY_PIN, LOW);
-            currentState = STATE_WAIT_FOR_BOOT;
-            stateTimer = now;
+            // Non-blocking PWRKEY pulse: rising edge this tick, falling edge once
+            // PWRKEY_PULSE_MS has elapsed, instead of delay()ing inside the handler.
+            if (!pwrKeyPulseActive) {
+                Serial.println("State: POWER_ON");
+                digitalWrite(MC60_PWRKEY_PIN, HIGH);
+                pwrKeyPulseActive = true;
+                stateTimer = now;
+            } else if (now - stateTimer >= PWRKEY_PULSE_MS) {
+                digitalWrite(MC60_PWRKEY_PIN, LOW);
+                pwrKeyPulseActive = false;
+                enterState(STATE_WAIT_FOR_BOOT);
+            }
             break;
 
         case STATE_WAIT_FOR_BOOT:
@@ -100,27 +136,31 @@ void loop() {
                 String resp = sendCommand("AT", 1000);
                 if (resp.indexOf("OK") != -1) {
                     Serial.println("Module responsive.");
-                    currentState = STATE_CHECK_SIM;
-                    retryCounter = 0;
+                    bootRetryCounter = 0;
+                    enterState(STATE_CHECK_SIM);
                 } else {
-                    Serial.println("No response, retry power-on...");
-                    currentState = STATE_POWER_ON;
+                    bootRetryCounter++;
+                    if (bootRetryCounter >= MAX_RETRIES) {
+                        Serial.println("Module unresponsive after repeated power cycles.");
+                        enterState(STATE_FATAL_ERROR);
+                    } else {
+                        Serial.println("No response, retry power-on...");
+                        enterState(STATE_POWER_ON);
+                    }
                 }
-                stateTimer = now;
             }
             break;
 
         case STATE_CHECK_SIM:
             if (sendCommand("AT+CPIN?", 3000).indexOf("+CPIN: READY") != -1) {
                 Serial.println("SIM ready.");
-                currentState = STATE_INIT_SMS_ROUTING;
-                retryCounter = 0;
+                enterState(STATE_INIT_SMS_ROUTING);
             } else {
                 Serial.println("Waiting for SIM...");
                 retryCounter++;
-                if (retryCounter >= MAX_RETRIES) currentState = STATE_FATAL_ERROR;
+                stateTimer = now;
+                if (retryCounter >= MAX_RETRIES) enterState(STATE_FATAL_ERROR);
             }
-            stateTimer = now;
             break;
 
         case STATE_INIT_SMS_ROUTING:
@@ -129,8 +169,7 @@ void loop() {
             // SMS'leri SIM'e kaydetme, direkt seri porta fırlat
             sendCommand("AT+CNMI=2,2,0,0,0", 2000);
             Serial.println("Direct SMS Routing Enabled. Messages will not be saved on SIM.");
-            currentState = STATE_CHECK_NETWORK;
-            stateTimer = now;
+            enterState(STATE_CHECK_NETWORK);
             break;
 
         case STATE_CHECK_NETWORK:
@@ -138,13 +177,13 @@ void loop() {
                 String resp = sendCommand("AT+CREG?", 2000);
                 if (resp.indexOf(",1") != -1 || resp.indexOf(",5") != -1) {
                     Serial.println("Network registered.");
-                    currentState = STATE_ATTACH_GPRS;
+                    enterState(STATE_ATTACH_GPRS);
                 } else {
                     Serial.println("Waiting for network...");
                     retryCounter++;
-                    if (retryCounter >= MAX_RETRIES*2) currentState = STATE_FATAL_ERROR;
+                    stateTimer = now;
+                    if (retryCounter >= MAX_RETRIES*2) enterState(STATE_FATAL_ERROR);
                 }
-                stateTimer = now;
             }
             break;
 
@@ -152,59 +191,59 @@ void loop() {
             sendCommand("AT+CGATT=1", 3000);
             if (sendCommand("AT+CGATT?", 2000).indexOf("+CGATT: 1") != -1) {
                 Serial.println("GPRS attached.");
-                currentState = STATE_SET_APN;
+                enterState(STATE_SET_APN);
             } else {
                 Serial.println("Waiting for GPRS attachment...");
                 retryCounter++;
-                if (retryCounter >= MAX_RETRIES) currentState = STATE_FATAL_ERROR;
+                stateTimer = now;
+                if (retryCounter >= MAX_RETRIES) enterState(STATE_FATAL_ERROR);
             }
-            stateTimer = now;
             break;
 
         case STATE_SET_APN:
             if (sendCommand("AT+QIREGAPP=\"" + String(SIM_APN) + "\",\"\",\"\"", 5000).indexOf("OK") != -1) {
                 Serial.println("APN set.");
-                currentState = STATE_MQTT_OPEN;
+                enterState(STATE_MQTT_OPEN);
             } else {
                 Serial.println("Failed to set APN.");
                 retryCounter++;
-                if (retryCounter >= MAX_RETRIES) currentState = STATE_FATAL_ERROR;
+                stateTimer = now;
+                if (retryCounter >= MAX_RETRIES) enterState(STATE_FATAL_ERROR);
             }
-            stateTimer = now;
             break;
 
         case STATE_MQTT_OPEN:
             if (sendCommand("AT+QMTOPEN=0,\"" + String(ADAFRUIT_SERVER) + "\"," + String(ADAFRUIT_PORT), 10000).indexOf("+QMTOPEN: 0,0") != -1) {
                 Serial.println("MQTT socket opened.");
-                currentState = STATE_MQTT_CONNECT;
+                enterState(STATE_MQTT_CONNECT);
             } else {
                 Serial.println("MQTT open failed, retrying...");
-                retryCounter++;
-                if (retryCounter >= MAX_RETRIES) currentState = STATE_FATAL_ERROR;
                 sendCommand("AT+QMTCLOSE=0", 5000);
+                retryCounter++;
+                stateTimer = now;
+                if (retryCounter >= MAX_RETRIES) enterState(STATE_FATAL_ERROR);
             }
-            stateTimer = now;
             break;
 
         case STATE_MQTT_CONNECT:
             if (sendCommand("AT+QMTCONN=0,\"gps-tracker\",\"" + String(IO_USERNAME) + "\",\"" + String(IO_KEY) + "\"", 10000).indexOf("+QMTCONN: 0,0,0") != -1) {
                 Serial.println("MQTT connected.");
-                currentState = STATE_ENABLE_GPS;
+                consecutivePublishFailures = 0;
+                enterState(STATE_ENABLE_GPS);
             } else {
                 Serial.println("MQTT connect failed.");
-                retryCounter++;
-                if (retryCounter >= MAX_RETRIES) currentState = STATE_FATAL_ERROR;
                 sendCommand("AT+QMTCLOSE=0", 5000);
+                retryCounter++;
+                stateTimer = now;
+                if (retryCounter >= MAX_RETRIES) enterState(STATE_FATAL_ERROR);
             }
-            stateTimer = now;
             break;
 
         case STATE_ENABLE_GPS:
             sendCommand("AT+QGNSSC=1", 1000);
             gpsEnabled = true;
             Serial.println("GPS enabled.");
-            stateTimer = now;
-            currentState = STATE_WAIT_GPS_FIX;
+            enterState(STATE_WAIT_GPS_FIX);
             break;
 
         case STATE_WAIT_GPS_FIX: {
@@ -212,14 +251,14 @@ void loop() {
             if (getGPSCoordinates(lat, lon)) {
                 Serial.println("Valid GPS fix acquired.");
                 lastUploadTime = now;
-                currentState = STATE_RUNNING;
+                enterState(STATE_RUNNING);
             } else if (now - stateTimer > GPS_FIX_TIMEOUT_MS) {
                 Serial.println("GPS fix timeout, continuing anyway.");
-                currentState = STATE_RUNNING;
+                lastUploadTime = now;
+                enterState(STATE_RUNNING);
             } else {
                 Serial.println("Waiting for valid GPS fix...");
             }
-            delay(1000);
             break;
         }
 
@@ -227,15 +266,46 @@ void loop() {
             // Sadece belirli aralıklarla Adafruit'e konum at
             if (gpsEnabled && now - lastUploadTime >= UPLOAD_INTERVAL_MS) {
                 float lat, lon;
-                if (getGPSCoordinates(lat, lon)) publishToAdafruitIO(lat, lon);
+                if (getGPSCoordinates(lat, lon)) {
+                    if (publishToAdafruitIO(lat, lon)) {
+                        consecutivePublishFailures = 0;
+                    } else {
+                        consecutivePublishFailures++;
+                    }
+                }
                 lastUploadTime = now;
+
+                if (consecutivePublishFailures >= MAX_PUBLISH_FAILURES) {
+                    Serial.println("Too many failed publishes, reconnecting MQTT...");
+                    sendCommand("AT+QMTCLOSE=0", 5000);
+                    enterState(STATE_MQTT_OPEN);
+                }
             }
             break;
 
-        case STATE_FATAL_ERROR:
-            Serial.println("FATAL ERROR! Halting.");
-            delay(10000);
+        case STATE_FATAL_ERROR: {
+            static unsigned long lastFatalPrint = 0;
+            if (now - lastFatalPrint > 5000) {
+                unsigned long remaining = (now - stateTimer < FATAL_ERROR_RESTART_MS)
+                    ? (FATAL_ERROR_RESTART_MS - (now - stateTimer)) / 1000
+                    : 0;
+                Serial.println("FATAL ERROR! Restarting in " + String(remaining) + "s");
+                lastFatalPrint = now;
+            }
+            if (now - stateTimer > FATAL_ERROR_RESTART_MS) {
+                Serial.println("Restarting ESP32 to recover...");
+                ESP.restart();
+            }
             break;
+        }
+    }
+
+    // Process at most one queued SMS command per loop iteration. This runs
+    // only here, never from inside sendCommand()'s wait loop, so it can never
+    // re-enter the AT engine mid-transaction.
+    PendingSms pending;
+    if (dequeueSms(pending)) {
+        processSmsCommand(pending.sender, pending.text);
     }
 }
 
@@ -248,32 +318,72 @@ String sendCommand(String cmd, unsigned long timeout, bool print) {
 
     unsigned long start = millis();
     String response = "";
-    
+
     // Gelen veriyi körlemesine silmek yerine, global buffer'a da ekliyoruz.
     // Bu sayede komut beklerken araya giren SMS'ler silinmemiş oluyor.
     while(millis() - start < timeout) {
         while(MC60Serial.available()) {
             char c = MC60Serial.read();
             response += c;
-            mc60Buffer += c; 
+            mc60Buffer += c;
         }
     }
     if(print && response.length()>0) Serial.println("<< " + response);
-    
-    checkForSMS(); // Komut sonrasında buffer'ı kontrol et
+
+    // Only extracts+queues any SMS that arrived while we were waiting; it does
+    // NOT dispatch/act on it, so this is safe to call while mid-transaction.
+    checkForSMS();
     return response;
 }
 
 // --- Authorization Check ---
+// Numbers are matched on their last 10 digits so "+905551234567", "05551234567"
+// and "5551234567" all match the same allowlist entry.
+String last10Digits(const String &number) {
+    String digits = "";
+    for (size_t i = 0; i < number.length(); i++) {
+        if (isDigit(number[i])) digits += number[i];
+    }
+    if (digits.length() > 10) digits = digits.substring(digits.length() - 10);
+    return digits;
+}
+
 bool isAuthorized(String number) {
-    if (number.length() == 0) return false;
+    String numDigits = last10Digits(number);
+    if (numDigits.length() == 0) return false;
     for (size_t i = 0; i < kAuthorizedCount; i++) {
-        if (number.equals(kAuthorized[i])) return true;
+        if (numDigits == last10Digits(String(kAuthorized[i]))) return true;
     }
     return false;
 }
 
+// --- SMS queue helpers ---
+bool enqueueSms(const String &sender, const String &text) {
+    if (smsQueueCount >= SMS_QUEUE_CAPACITY) {
+        Serial.println("SMS queue full, dropping message.");
+        return false;
+    }
+    size_t idx = (smsQueueHead + smsQueueCount) % SMS_QUEUE_CAPACITY;
+    smsQueue[idx].sender = sender;
+    smsQueue[idx].text = text;
+    smsQueueCount++;
+    return true;
+}
+
+bool dequeueSms(PendingSms &out) {
+    if (smsQueueCount == 0) return false;
+    out = smsQueue[smsQueueHead];
+    smsQueueHead = (smsQueueHead + 1) % SMS_QUEUE_CAPACITY;
+    smsQueueCount--;
+    return true;
+}
+
 // --- Asynchronous SMS Parsing (sender extraction added) ---
+// IMPORTANT: this only parses the URC and enqueues it. It must never call
+// sendCommand()/sendSMS()/powerOffModule() directly -- it runs re-entrantly
+// from inside sendCommand()'s wait loop, and acting here would re-enter the
+// AT engine mid-transaction. Actual dispatch happens in processSmsCommand(),
+// called only from the top level of loop().
 void checkForSMS() {
     // AT+CNMI=2,2 aktifken gelen SMS'ler "+CMT:" başlığı ile başlar
     int cmtIdx = mc60Buffer.indexOf("+CMT:");
@@ -296,8 +406,8 @@ void checkForSMS() {
                 // Mesaj metnini çıkart
                 String smsText = mc60Buffer.substring(headerEnd + 1, textEnd);
                 smsText.trim();
-                
-                // KRİTİK NOKTA: Sonsuz döngüye girmemek için cevap vermeden ÖNCE hafızayı temizle!
+
+                // KRİTİK NOKTA: Sonsuz döngüye girmemek için hafızayı hemen temizle!
                 mc60Buffer.remove(0, textEnd + 1);
 
                 Serial.println("\n[*** DIRECT SMS RECEIVED ***]");
@@ -307,26 +417,8 @@ void checkForSMS() {
                 // Yetki kontrolü: listede olmayan numaralar sessizce yok sayılır
                 if (!isAuthorized(sender)) {
                     Serial.println("Sender NOT authorized. Ignoring.");
-                    return;
-                }
-
-                // Komut karşılaştırmasını "içeriyor mu" mantığıyla yap
-                String cmd = smsText;
-                cmd.toUpperCase();
-
-                if (cmd.endsWith("PWROFF")) {
-                    Serial.println("Action: Powering Off.");
-                    sendSMS(sender, "Powering off.");
-                    powerOffModule();
-                } else if (cmd.endsWith("LOC") || cmd.endsWith("GPS") || cmd.endsWith("GETGPS")) {
-                    Serial.println("Action: Fetching GPS and replying...");
-                    sendGPSviaSMS(sender);
-                } else if (cmd.endsWith("STATUS")) {
-                    Serial.println("Action: Sending status...");
-                    String msg = "State=" + String((int)currentState) + " Uptime=" + String(millis() / 1000) + "s";
-                    sendSMS(sender, msg);
                 } else {
-                    sendSMS(sender, "Unknown command. Try: LOC, STATUS, PWROFF");
+                    enqueueSms(sender, smsText);
                 }
             }
         }
@@ -334,7 +426,29 @@ void checkForSMS() {
 
     // Sistemin hafızasını temiz tut (Gereksiz AT komut cevapları birikmesin)
     if (mc60Buffer.length() > 1000) {
-        mc60Buffer = ""; 
+        mc60Buffer = "";
+    }
+}
+
+// --- Dispatch a queued SMS command (only ever called from loop(), never
+// re-entrantly from sendCommand()) ---
+void processSmsCommand(const String &sender, const String &text) {
+    String cmd = text;
+    cmd.toUpperCase();
+
+    if (cmd.endsWith("PWROFF")) {
+        Serial.println("Action: Powering Off.");
+        sendSMS(sender, "Powering off.");
+        powerOffModule();
+    } else if (cmd.endsWith("LOC") || cmd.endsWith("GPS") || cmd.endsWith("GETGPS")) {
+        Serial.println("Action: Fetching GPS and replying...");
+        sendGPSviaSMS(sender);
+    } else if (cmd.endsWith("STATUS")) {
+        Serial.println("Action: Sending status...");
+        String msg = "State=" + String((int)currentState) + " Uptime=" + String(millis() / 1000) + "s";
+        sendSMS(sender, msg);
+    } else {
+        sendSMS(sender, "Unknown command. Try: LOC, STATUS, PWROFF");
     }
 }
 
@@ -368,19 +482,25 @@ bool getGPSCoordinates(float &lat, float &lon) {
     if(ggaIndex == -1) return false;
 
     int endLine = resp.indexOf('\n', ggaIndex);
+    if (endLine == -1) endLine = resp.length();
     String gga = resp.substring(ggaIndex, endLine);
 
-    char gga_cstr[gga.length()+1];
-    strcpy(gga_cstr, gga.c_str());
-    char* token = strtok(gga_cstr, ",");
-    String fields[15];
+    // Manual comma split that preserves empty fields (weak fixes produce
+    // consecutive commas like "...,,,,0,,,,..." -- strtok collapses those
+    // and shifts every field index after them).
+    const int MAX_FIELDS = 16;
+    String fields[MAX_FIELDS];
     int count = 0;
-    while(token && count<15) {
-        fields[count++] = String(token);
-        token = strtok(NULL,",");
+    int start = 0;
+    for (int i = 0; i <= (int)gga.length() && count < MAX_FIELDS; i++) {
+        if (i == (int)gga.length() || gga[i] == ',') {
+            fields[count++] = gga.substring(start, i);
+            start = i + 1;
+        }
     }
 
-    if(count<7 || fields[6]=="0") return false; // GPS sinyali/fix yok
+    if (count < 7 || fields[6].length() == 0 || fields[6] == "0") return false; // GPS sinyali/fix yok
+    if (fields[2].length() == 0 || fields[4].length() == 0) return false;       // lat/lon boş
 
     float latVal = fields[2].toFloat();
     lat = floor(latVal/100) + fmod(latVal,100)/60.0;
@@ -394,9 +514,10 @@ bool getGPSCoordinates(float &lat, float &lon) {
 }
 
 // --- Publish to Adafruit IO ---
-void publishToAdafruitIO(float lat, float lon) {
+bool publishToAdafruitIO(float lat, float lon) {
     String feedPath = String(IO_USERNAME) + "/feeds/" + String(FEED_NAME);
-    String payload = "{\"lat\":" + String(lat,6) + ",\"lon\":" + String(lon,6) + "}";
+    // "value" must be "lat,lon" for Adafruit IO's map dashboard block to render it.
+    String payload = "{\"value\":\"" + String(lat,6) + "," + String(lon,6) + "\",\"lat\":" + String(lat,6) + ",\"lon\":" + String(lon,6) + "}";
     String cmd = "AT+QMTPUB=0,0,0,0,\"" + feedPath + "\"";
     String resp = sendCommand(cmd,5000);
     if(resp.indexOf(">")!=-1) {
@@ -405,14 +526,18 @@ void publishToAdafruitIO(float lat, float lon) {
         MC60Serial.write(26); // Ctrl+Z
         sendCommand("",10000); // Wait final OK
         Serial.println("Published to Adafruit IO!");
-    } else Serial.println("Failed MQTT publish.");
+        return true;
+    }
+    Serial.println("Failed MQTT publish.");
+    return false;
 }
 
 // --- Power Off Module ---
 void powerOffModule() {
     digitalWrite(MC60_PWRKEY_PIN, HIGH);
-    delay(1200); 
+    delay(1200);
     digitalWrite(MC60_PWRKEY_PIN, LOW);
     Serial.println("Module powered off.");
-    currentState = STATE_POWER_ON; 
+    gpsEnabled = false;
+    enterState(STATE_POWER_ON);
 }
