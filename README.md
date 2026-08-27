@@ -4,7 +4,7 @@ Custom-PCB GPS tracker built around an ESP32-S3-WROOM and a Quectel MC60
 GSM/GPRS/GNSS module. It publishes its position to Adafruit IO over MQTT via
 GPRS, and accepts SMS commands from an allowlist of authorized numbers.
 
-Written in C++ on the Arduino framework, built with PlatformIO.
+Written in C on native ESP-IDF (no Arduino framework, no PlatformIO).
 
 > Third-year Mechatronics Engineering project. The firmware is a non-blocking
 > state machine — no `delay()` in the main path, so incoming SMS is still
@@ -43,9 +43,9 @@ Altium Designer to view or edit.
 ## Build
 
 ```bash
-pio run              # build
-pio run -t upload    # flash
-pio device monitor -b 115200
+idf.py set-target esp32s3
+idf.py build
+idf.py -p <PORT> flash monitor
 ```
 
 ## Configuration
@@ -53,7 +53,7 @@ pio device monitor -b 115200
 Credentials are **not** in the repository. Copy the template and fill it in:
 
 ```bash
-cp src/credentials.example.h src/credentials.h
+cp main/credentials.example.h main/credentials.h
 ```
 
 | Macro | Meaning |
@@ -63,33 +63,35 @@ cp src/credentials.example.h src/credentials.h
 | `SIM_APN` | Carrier APN |
 | `AUTHORIZED_NUMBERS` | Numbers allowed to issue SMS commands |
 
-`src/credentials.h` is gitignored.
+`main/credentials.h` is gitignored.
 
 ## SMS commands
 
 | Command | Effect |
 |---|---|
-| `STATUS` | Replies with current fix, signal quality and MQTT state |
-| `REBOOT` | Power-cycles the MC60 and restarts the state machine |
-| `PWROFF` | `AT+QPOWD=1` on the module, then ESP32 deep sleep |
+| `LOC` / `GPS` / `GETGPS` | Replies with the current GPS fix as a Google Maps link |
+| `STATUS` | Replies with the current state-machine state and uptime |
+| `PWROFF` | Pulses PWRKEY to power off the MC60 and returns the state machine to `STATE_POWER_ON` |
 
-Commands arriving mid-transaction are queued and executed from `loop()`, never
-from inside the AT engine.
+Commands arriving mid-transaction are queued and executed from the top level
+of the main loop, never from inside the AT engine.
 
 ## Architecture
 
-A state machine in `main.cpp`, driven from `loop()` via `currentState`.
-Transitions go through `enterState()`, which resets the per-state retry
-counter — state handlers never assign `currentState` directly.
+A state machine in `main.c`, driven from `app_main()`'s loop via
+`current_state`. Transitions go through `enter_state()`, which resets the
+per-state retry counter — state handlers never assign `current_state`
+directly.
 
-`sendCommand()` is the blocking AT helper: it busy-waits up to its timeout
-argument, buffering incoming bytes into `mc60Buffer` as they arrive so an SMS
-URC that lands mid-transaction isn't lost. `checkForSMS()` parses `+CMT:`
-URCs out of that buffer and queues authorized senders' commands onto
-`smsQueue`; it never dispatches directly, since it also runs re-entrantly
-from inside `sendCommand()`'s wait loop. `processSmsCommand()` drains that
-queue and executes `LOC` / `STATUS` / `PWROFF` — called only from the top
-level of `loop()`, so it can't re-enter the AT engine mid-transaction.
+`mc60_send_command()` (in `mc60.c`) is the blocking AT helper: it waits its
+full timeout argument, buffering incoming bytes into a rolling buffer as they
+arrive so an SMS URC that lands mid-transaction isn't lost. `mc60_pump()`
+parses `+CMT:` URCs out of that buffer and queues authorized senders'
+commands onto an SMS queue; it never dispatches directly, since it also runs
+re-entrantly from inside `mc60_send_command()`'s wait loop. `main.c`'s
+`process_sms_command()` drains that queue and executes `LOC` / `STATUS` /
+`PWROFF` — called only from the top level of the main loop, so it can't
+re-enter the AT engine mid-transaction.
 
 NMEA fields are split manually rather than with `strtok`, because `strtok`
 collapses consecutive commas and GGA is full of empty fields on a weak fix.

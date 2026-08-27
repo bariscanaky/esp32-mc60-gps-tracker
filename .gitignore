@@ -1,7 +1,9 @@
-# PlatformIO
-.pio/
-.pioenvs/
-.piolibdeps/
+# ESP-IDF build artifacts
+build/
+sdkconfig
+sdkconfig.old
+dependencies.lock
+managed_components/
 
 # VS Code
 .vscode/.browse.c_cpp.db*
@@ -10,7 +12,7 @@
 .vscode/ipch/
 
 # Secrets — never commit
-src/credentials.h
+main/credentials.h
 
 # Claude Code local notes
 claude.md
