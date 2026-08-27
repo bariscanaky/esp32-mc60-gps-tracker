@@ -1,4 +1,4 @@
-# ESP32-S3 + MC60 GPS Tracker
+# ESP32-MC60 GPS Tracker
 
 Custom-PCB GPS tracker built around an ESP32-S3-WROOM and a Quectel MC60
 GSM/GPRS/GNSS module. It publishes its position to Adafruit IO over MQTT via
@@ -21,7 +21,6 @@ Written in C++ on the Arduino framework, built with PlatformIO.
 - Replies go back to the *sender*, not to a hardcoded number
 - Automatic recovery: per-state retry counters, MC60 power-cycle and FSM
   restart instead of a dead halt state
-- SSD1306 128×64 OLED status display over I²C
 
 ## Hardware
 
@@ -29,7 +28,6 @@ Written in C++ on the Arduino framework, built with PlatformIO.
 |---|---|
 | ESP32-S3-WROOM | Custom board, not a devkit. Flashed over UART0. |
 | Quectel MC60 | GSM/GPRS/GNSS. Hardware UART. PWRKEY pulse to boot; needs ~5 s before it answers AT. |
-| SSD1306 OLED | 128×64, I²C address `0x3C`, no reset pin (`-1`) |
 | Power | Li-ion. GSM TX bursts pull hard — a marginal cell will brown the module out. |
 
 <!-- TODO: pin table + a photo of the board here. Bir kart fotoğrafı README'yi

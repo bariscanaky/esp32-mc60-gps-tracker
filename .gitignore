@@ -13,6 +13,7 @@
 src/credentials.h
 
 # Claude Code local notes
+claude.md
 CLAUDE.local.md
 .claude/settings.local.json
 
